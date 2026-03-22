@@ -134,7 +134,7 @@ private def buildApp (rm : RamMap) : StoreM (Hash × Hash) := do
   -- -------------------------------------------------------------------------
   let h_panic ← StoreM.node (.proc #[] #[]
     (.intrinsic #["_L_panic:", "    goto    _L_panic"] #[] #[]
-                #["halt: never returns"])
+                #["halt: never returns"] #[])
     "panic")
 
   let h_early_retfie ← StoreM.node (nodeRetfie false "early_retfie")
