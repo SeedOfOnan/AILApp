@@ -31,7 +31,6 @@
 --   AIL#20  Implicit Store merging — rb/ic nodes merged manually below.
 
 import AIL
-import AIL.Lib.RingBuf
 import AIL.Targets.PIC18.Emitter
 
 open AIL AIL.PIC18
@@ -133,9 +132,7 @@ private def n_panic : Node := .proc #[] #[]
   "panic"
 private def h_panic := hashNode n_panic
 
-private def n_early_retfie : Node := .proc #[] #[]
-  (.intrinsic #["    retfie  0"] #[] #[] #["early ISR exit"])
-  "early_retfie"
+private def n_early_retfie : Node := nodeRetfie false "early_retfie"
 private def h_early_retfie := hashNode n_early_retfie
 
 private def n_discard_rcreg : Node := .proc #[] #[]
@@ -166,12 +163,14 @@ private def n_if_ferr : Node := .proc #[] #[]
 private def h_if_ferr := hashNode n_if_ferr
 
 -- if full → set overrun + retfie
+-- set_overrun_and_retfie: SETF rx_overrun; RETFIE 0
+-- Expressed as ProcBody.seq of two ISA nodes (AIL issue #9).
+private def n_sor_setf   : Node := nodeSetf h_rx_overrun "setf_rx_overrun"
+private def h_sor_setf   := hashNode n_sor_setf
+private def n_sor_retfie : Node := nodeRetfie false "retfie_sor"
+private def h_sor_retfie := hashNode n_sor_retfie
 private def n_set_overrun_and_retfie : Node := .proc #[] #[]
-  (.intrinsic
-    #[s!"    setf    {hashLabel h_rx_overrun}, c", "    retfie  0"]
-    #[] #[h_rx_overrun]
-    #["set rx_overrun flag; drop byte; exit ISR"])
-  "set_overrun_and_retfie"
+  (.seq #[h_sor_setf, h_sor_retfie]) "set_overrun_and_retfie"
 private def h_set_overrun_and_retfie := hashNode n_set_overrun_and_retfie
 
 private def n_if_full : Node := .proc #[] #[]
@@ -191,14 +190,16 @@ private def h_uart_rx_isr := hashNode n_uart_rx_isr
 -- ---------------------------------------------------------------------------
 
 -- is_empty: head == tail (buffer empty)
--- CPFSEQ skips when TRUE (head == tail = empty) — satisfies proc [] [Bool] 0
+-- MOVF tail, W  then  CPFSEQ head — skip-when-TRUE: equal = buffer empty.
+-- Expressed as ProcBody.seq of two ISA nodes (AIL issue #9).
+-- Outer proc has rets = #[h_bool_empty] → type Ty.proc [] [Ty.bool] 0
+-- which satisfies whileLoop_ok's cond constraint.
+private def n_ie_movf  : Node := nodeMovf_w rb.h_tail "is_empty_movf_tail"
+private def h_ie_movf  := hashNode n_ie_movf
+private def n_ie_cpfseq : Node := nodeCpfseq rb.h_head "is_empty_cpfseq_head"
+private def h_ie_cpfseq := hashNode n_ie_cpfseq
 private def n_is_empty : Node := .proc #[] #[h_bool_empty]
-  (.intrinsic
-    #[s!"    movf    {hashLabel rb.h_tail}, w, c",
-      s!"    cpfseq  {hashLabel rb.h_head}, c"]
-    #[rb.h_head, rb.h_tail] #[]
-    #["condition: head == tail (buffer empty)"])
-  "rx_is_empty"
+  (.seq #[h_ie_movf, h_ie_cpfseq]) "rx_is_empty"
 private def h_is_empty := hashNode n_is_empty
 
 -- getch: spin until non-empty, then pop
@@ -211,22 +212,28 @@ private def n_getch_spin : Node := .proc #[] #[]
 private def h_getch_spin := hashNode n_getch_spin
 
 -- pop: FSR0-indirect read of buf[head] → getch_result; advance head mod 32
--- TODO: AIL#13 — uses FSR0, conflicts with ISR push. AIL#14 needed for safety.
+-- Expressed as ProcBody.seq of single-instruction ISA nodes (AIL issue #9).
+-- Uses FSR0; caller (critical_pop) wraps in BCF/BSF INTCON.GIE (AIL#14).
+-- TODO AIL#13: FSR annotation would make FSR0 usage statically checkable.
+private def n_pop_s1 : Node := nodeLfsr0   rb.h_data      "pop_s1_lfsr0_data"
+private def h_pop_s1 := hashNode n_pop_s1
+private def n_pop_s2 : Node := nodeMovf_w  rb.h_head      "pop_s2_movf_head"
+private def h_pop_s2 := hashNode n_pop_s2
+private def n_pop_s3 : Node := nodeAddwf_FSR0L             "pop_s3_addwf_fsr0l"
+private def h_pop_s3 := hashNode n_pop_s3
+private def n_pop_s4 : Node := nodeMovf_INDF0_w            "pop_s4_movf_indf0"
+private def h_pop_s4 := hashNode n_pop_s4
+private def n_pop_s5 : Node := nodeMovwf   h_getch_result  "pop_s5_movwf_result"
+private def h_pop_s5 := hashNode n_pop_s5
+private def n_pop_s6 : Node := nodeIncf_f  rb.h_head       "pop_s6_incf_head"
+private def h_pop_s6 := hashNode n_pop_s6
+private def n_pop_s7 : Node := nodeMovlw   31               "pop_s7_movlw_31"
+private def h_pop_s7 := hashNode n_pop_s7
+private def n_pop_s8 : Node := nodeAndwf_f rb.h_head       "pop_s8_andwf_head"
+private def h_pop_s8 := hashNode n_pop_s8
 private def n_pop : Node := .proc #[] #[h_getch_result]
-  (.intrinsic
-    #[s!"    lfsr    0, {hashLabel rb.h_data}",
-      s!"    movf    {hashLabel rb.h_head}, w, c",
-      "    addwf   FSR0L, f, c",
-      "    movf    INDF0, w, c",
-      s!"    movwf   {hashLabel h_getch_result}, c",
-      s!"    incf    {hashLabel rb.h_head}, f, c",
-      "    movlw   31",
-      s!"    andwf   {hashLabel rb.h_head}, f, c"]
-    #[rb.h_data, rb.h_head] #[rb.h_head, h_getch_result]
-    #["pop buf[head] → getch_result; advance head mod 32",
-      "uses FSR0; caller (critical_pop) wraps in BCF/BSF INTCON.GIE (AIL#14 resolved)",
-      "TODO AIL#13: FSR annotation would make the FSR0 usage statically checkable"])
-  "rx_pop"
+  (.seq #[h_pop_s1, h_pop_s2, h_pop_s3, h_pop_s4,
+          h_pop_s5, h_pop_s6, h_pop_s7, h_pop_s8]) "rx_pop"
 private def h_pop := hashNode n_pop
 
 -- critical section: disable_ints; pop; enable_ints
@@ -258,29 +265,28 @@ private def n_test_nl : Node := .proc #[] #[h_bool_nl]
 private def h_test_nl := hashNode n_test_nl
 
 -- append_line: line_buf[line_len] = getch_result; line_len++
--- Uses FSR1 (not FSR0) — no conflict with getch pop (FSR0).
+-- Expressed as ProcBody.seq of single-instruction ISA nodes (AIL issue #9).
+-- Uses FSR1 (distinct from FSR0 used by getch pop — no FSR conflict).
+private def n_al_s1 : Node := nodeLfsr1     h_line_buf     "al_s1_lfsr1_linebuf"
+private def h_al_s1 := hashNode n_al_s1
+private def n_al_s2 : Node := nodeMovf_w    h_line_len     "al_s2_movf_linelen"
+private def h_al_s2 := hashNode n_al_s2
+private def n_al_s3 : Node := nodeAddwf_FSR1L               "al_s3_addwf_fsr1l"
+private def h_al_s3 := hashNode n_al_s3
+private def n_al_s4 : Node := nodeMovf_w    h_getch_result "al_s4_movf_result"
+private def h_al_s4 := hashNode n_al_s4
+private def n_al_s5 : Node := nodeMovwf_INDF1               "al_s5_movwf_indf1"
+private def h_al_s5 := hashNode n_al_s5
+private def n_al_s6 : Node := nodeIncf_f    h_line_len     "al_s6_incf_linelen"
+private def h_al_s6 := hashNode n_al_s6
 private def n_append_line : Node := .proc #[] #[]
-  (.intrinsic
-    #[s!"    lfsr    1, {hashLabel h_line_buf}",
-      s!"    movf    {hashLabel h_line_len}, w, c",
-      "    addwf   FSR1L, f, c",
-      s!"    movf    {hashLabel h_getch_result}, w, c",
-      "    movwf   INDF1, c",
-      s!"    incf    {hashLabel h_line_len}, f, c"]
-    #[h_line_buf, h_line_len, h_getch_result] #[h_line_len]
-    #["line_buf[line_len] = getch_result; line_len++",
-      "uses FSR1 (distinct from FSR0 used by getch pop — no FSR conflict)"])
-  "append_line"
+  (.seq #[h_al_s1, h_al_s2, h_al_s3, h_al_s4, h_al_s5, h_al_s6]) "append_line"
 private def h_append_line := hashNode n_append_line
 
 -- process_line: consume accumulated line (stub)
+-- CLRF line_len — clear line length counter.
 -- TODO: implement command dispatch / echo
-private def n_process_line : Node := .proc #[] #[]
-  (.intrinsic
-    #[s!"    clrf    {hashLabel h_line_len}, c"]
-    #[] #[h_line_len]
-    #["stub: clear line buffer; TODO implement line processing"])
-  "process_line"
+private def n_process_line : Node := nodeClrf h_line_len "process_line"
 private def h_process_line := hashNode n_process_line
 
 -- if newline → process_line else → append_line
@@ -328,34 +334,55 @@ def appStore : Store :=
   -- Utilities
   let s := Store.insert s h_nop               n_nop
   -- ISR nodes
-  let s := Store.insert s h_panic             n_panic
-  let s := Store.insert s h_early_retfie      n_early_retfie
-  let s := Store.insert s h_discard_rcreg     n_discard_rcreg
-  let s := Store.insert s h_read_rcreg        n_read_rcreg
-  let s := Store.insert s h_test_oerr         n_test_oerr
-  let s := Store.insert s h_if_oerr           n_if_oerr
-  let s := Store.insert s h_test_ferr         n_test_ferr
-  let s := Store.insert s h_discard_and_retfie n_discard_and_retfie
-  let s := Store.insert s h_if_ferr           n_if_ferr
+  let s := Store.insert s h_panic                  n_panic
+  let s := Store.insert s h_early_retfie           n_early_retfie
+  let s := Store.insert s h_discard_rcreg          n_discard_rcreg
+  let s := Store.insert s h_read_rcreg             n_read_rcreg
+  let s := Store.insert s h_test_oerr              n_test_oerr
+  let s := Store.insert s h_if_oerr                n_if_oerr
+  let s := Store.insert s h_test_ferr              n_test_ferr
+  let s := Store.insert s h_discard_and_retfie     n_discard_and_retfie
+  let s := Store.insert s h_if_ferr                n_if_ferr
+  -- set_overrun_and_retfie: step nodes + composite
+  let s := Store.insert s h_sor_setf               n_sor_setf
+  let s := Store.insert s h_sor_retfie             n_sor_retfie
   let s := Store.insert s h_set_overrun_and_retfie n_set_overrun_and_retfie
-  let s := Store.insert s h_if_full           n_if_full
-  let s := Store.insert s h_uart_rx_isr       n_uart_rx_isr
-  -- Main loop nodes
-  let s := Store.insert s h_is_empty          n_is_empty
-  let s := Store.insert s h_getch_nop         n_getch_nop
-  let s := Store.insert s h_getch_spin        n_getch_spin
-  let s := Store.insert s h_pop               n_pop
-  let s := Store.insert s h_critical_pop      n_critical_pop
-  let s := Store.insert s h_getch             n_getch
-  let s := Store.insert s h_load_gc           n_load_gc
-  let s := Store.insert s h_xor_nl            n_xor_nl
-  let s := Store.insert s h_test_z            n_test_z
-  let s := Store.insert s h_test_nl           n_test_nl
-  let s := Store.insert s h_append_line       n_append_line
-  let s := Store.insert s h_process_line      n_process_line
-  let s := Store.insert s h_if_nl             n_if_nl
-  let s := Store.insert s h_main_body         n_main_body
-  let s := Store.insert s h_main              n_main
+  let s := Store.insert s h_if_full                n_if_full
+  let s := Store.insert s h_uart_rx_isr            n_uart_rx_isr
+  -- Main loop: is_empty step nodes + composite
+  let s := Store.insert s h_ie_movf                n_ie_movf
+  let s := Store.insert s h_ie_cpfseq              n_ie_cpfseq
+  let s := Store.insert s h_is_empty               n_is_empty
+  let s := Store.insert s h_getch_nop              n_getch_nop
+  let s := Store.insert s h_getch_spin             n_getch_spin
+  -- pop: step nodes + composite
+  let s := Store.insert s h_pop_s1                 n_pop_s1
+  let s := Store.insert s h_pop_s2                 n_pop_s2
+  let s := Store.insert s h_pop_s3                 n_pop_s3
+  let s := Store.insert s h_pop_s4                 n_pop_s4
+  let s := Store.insert s h_pop_s5                 n_pop_s5
+  let s := Store.insert s h_pop_s6                 n_pop_s6
+  let s := Store.insert s h_pop_s7                 n_pop_s7
+  let s := Store.insert s h_pop_s8                 n_pop_s8
+  let s := Store.insert s h_pop                    n_pop
+  let s := Store.insert s h_critical_pop           n_critical_pop
+  let s := Store.insert s h_getch                  n_getch
+  let s := Store.insert s h_load_gc                n_load_gc
+  let s := Store.insert s h_xor_nl                 n_xor_nl
+  let s := Store.insert s h_test_z                 n_test_z
+  let s := Store.insert s h_test_nl                n_test_nl
+  -- append_line: step nodes + composite
+  let s := Store.insert s h_al_s1                  n_al_s1
+  let s := Store.insert s h_al_s2                  n_al_s2
+  let s := Store.insert s h_al_s3                  n_al_s3
+  let s := Store.insert s h_al_s4                  n_al_s4
+  let s := Store.insert s h_al_s5                  n_al_s5
+  let s := Store.insert s h_al_s6                  n_al_s6
+  let s := Store.insert s h_append_line            n_append_line
+  let s := Store.insert s h_process_line           n_process_line
+  let s := Store.insert s h_if_nl                  n_if_nl
+  let s := Store.insert s h_main_body              n_main_body
+  let s := Store.insert s h_main                   n_main
   s
 
 -- IVT: vec 0 = main (reset), vec 1 = uart_rx_isr (high-priority)
