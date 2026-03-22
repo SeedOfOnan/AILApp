@@ -1,34 +1,33 @@
 -- AILApp.src.App
 -- PIC18 application: UART receive into line buffer.
 --
--- Memory map (manual allocation — see AIL#19 for compiler-managed static RAM):
---   0x20        rx_head
---   0x21        rx_tail
---   0x22        rx_temp   (ring buffer push scratch byte)
---   0x23–0x42   rx_data   (32-byte ring buffer body)
---   0x43        rx_overrun
---   0x44        getch_result
---   0x45        line_len
---   0x46–0x85   line_buf  (64-byte line accumulation buffer)
+-- Static RAM declarations (addresses assigned by allocateStatics — AIL#19):
+--   rx_head       1 byte   ring buffer head index
+--   rx_tail       1 byte   ring buffer tail index
+--   rx_temp       1 byte   ring buffer push scratch byte
+--   rx_data      32 bytes  ring buffer body
+--   rx_overrun    1 byte   overrun flag
+--   getch_result  1 byte   most recently received byte
+--   line_len      1 byte   current line accumulation length
+--   line_buf     64 bytes  line accumulation buffer
+--   (total: 102 bytes, allocated from 0x20)
 --
 -- IVT:
 --   vec 0 = main (reset entry, ProcBody.forever)
 --   vec 1 = uart_rx_isr (high-priority interrupt handler)
 --
 -- Language features used:
+--   StaticAlloc        — compiler-assigned RAM addresses (AIL#19)
 --   StoreM             — implicit hash management (AIL#18)
 --   ProcBody.forever   — main event loop
 --   ProcBody.whileLoop — getch spin-wait (AIL#12)
 --   ProcBody.cond      — OERR/FERR/full guards in ISR
 --   makeINTCON         — INTCON/GIE nodes for critical section (AIL#14)
---   ProcBody.intrinsic — ring buffer pop, line append (FSR ops not yet
---                        expressible as abstract typed nodes; AIL#13, #21)
 --
 -- Known design gaps (see LANGDEF.md and open GitHub issues):
 --   AIL#13  FSR resource annotations — pop/push use FSR0; the critical section
 --           (AIL#14) prevents ISR corruption but a typed annotation would allow
 --           the compiler to verify the non-conflict with FSR1 in append_line.
---   AIL#19  Static RAM allocator — addresses assigned manually here.
 
 import AIL
 import AIL.Targets.PIC18.Emitter
@@ -36,12 +35,36 @@ import AIL.Targets.PIC18.Emitter
 open AIL AIL.PIC18
 
 -- ---------------------------------------------------------------------------
+-- Static RAM allocation (AIL#19: compiler-assigned addresses).
+-- The agent declares name + type; the allocator assigns addresses.
+-- PIC18F56Q71 — allocating from 0x20 within bank 0 GPR.
+-- ---------------------------------------------------------------------------
+
+private def appStatics : Array StaticDecl := #[
+  { name := "rx_head",      width := .w8, count := 1  },
+  { name := "rx_tail",      width := .w8, count := 1  },
+  { name := "rx_temp",      width := .w8, count := 1  },
+  { name := "rx_data",      width := .w8, count := 32 },
+  { name := "rx_overrun",   width := .w8, count := 1  },
+  { name := "getch_result", width := .w8, count := 1  },
+  { name := "line_len",     width := .w8, count := 1  },
+  { name := "line_buf",     width := .w8, count := 64 },
+]
+
+-- Allocate from 0x20; 0xE0 bytes available (Access Bank + Bank 0, through 0xFF).
+private def appRamMap : RamMap :=
+  match allocateStatics appStatics 0x20 0xE0 with
+  | .ok (m, _) => m
+  | .error e   => panic! e
+
+-- ---------------------------------------------------------------------------
 -- Full program as a single StoreM build (AIL#18: implicit hash management).
+-- Addresses come from appRamMap (AIL#19); no manual address literals.
 -- All nodes are hashed and stored by the monad; no manual Store.insert calls.
 -- Returns (h_main, h_uart_rx_isr) for the IVT.
 -- ---------------------------------------------------------------------------
 
-private def buildApp : StoreM (Hash × Hash) := do
+private def buildApp (rm : RamMap) : StoreM (Hash × Hash) := do
 
   -- -------------------------------------------------------------------------
   -- UART SFRs (PIC18F56Q71, DS40002329F)
@@ -65,9 +88,12 @@ private def buildApp : StoreM (Hash × Hash) := do
   let h_Z ← StoreM.node (.bitField h_STATUS 2 "Z")
 
   -- -------------------------------------------------------------------------
-  -- Ring buffer (rx_head=0x20, rx_tail=0x21, rx_data=0x23, rx_temp=0x22, cap=32)
+  -- Ring buffer (addresses from RAM allocator — AIL#19)
   -- -------------------------------------------------------------------------
-  let rb ← makeRingBuf 0x20 0x21 0x23 0x22 32 1000 "rx"
+  let rb ← makeRingBuf
+    (rm.addr! "rx_head") (rm.addr! "rx_tail")
+    (rm.addr! "rx_data") (rm.addr! "rx_temp")
+    32 1000 "rx"
 
   -- -------------------------------------------------------------------------
   -- INTCON — critical section primitives (AIL#14)
@@ -76,12 +102,12 @@ private def buildApp : StoreM (Hash × Hash) := do
   let ic ← makeINTCON 0xFF2
 
   -- -------------------------------------------------------------------------
-  -- Application state
+  -- Application state (addresses from RAM allocator — AIL#19)
   -- -------------------------------------------------------------------------
-  let h_rx_overrun   ← StoreM.node (.data .data .w8 0x43 "rx_overrun")
-  let h_getch_result ← StoreM.node (.data .data .w8 0x44 "getch_result")
-  let h_line_len     ← StoreM.node (.data .data .w8 0x45 "line_len")
-  let h_line_buf     ← StoreM.node (.staticArray .data .w8 0x46 64 "line_buf")
+  let h_rx_overrun   ← StoreM.node (.data .data .w8 (rm.addr! "rx_overrun")   "rx_overrun")
+  let h_getch_result ← StoreM.node (.data .data .w8 (rm.addr! "getch_result") "getch_result")
+  let h_line_len     ← StoreM.node (.data .data .w8 (rm.addr! "line_len")     "line_len")
+  let h_line_buf     ← StoreM.node (.staticArray .data .w8 (rm.addr! "line_buf") 64 "line_buf")
 
   -- -------------------------------------------------------------------------
   -- Bool formals
@@ -239,7 +265,7 @@ private def buildApp : StoreM (Hash × Hash) := do
 -- Program store and IVT (derived from the monadic build)
 -- ---------------------------------------------------------------------------
 
-private def appBuild := StoreM.run buildApp
+private def appBuild := StoreM.run (buildApp appRamMap)
 
 def appStore : Store := appBuild.2
 
@@ -249,6 +275,9 @@ def appIVT : Array IVTEntry :=
 
 def main : IO Unit := do
   IO.println "=== AILApp: UART line buffer ==="
+  -- Print RAM map (AIL#19)
+  IO.println "  --- RAM map (compiler-assigned addresses) ---"
+  for line in appRamMap.renderMapFile do IO.println s!"  {line}"
   match checkStore targetConfig appStore with
   | .error (_, h) =>
       IO.println s!"  checkStore: FAIL (type error at hash {h})"
