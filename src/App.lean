@@ -17,17 +17,18 @@
 --
 -- Language features used:
 --   ProcBody.forever    — main event loop
---   ProcBody.whileLoop  — getch spin-wait (AIL#12, implemented)
+--   ProcBody.whileLoop  — getch spin-wait (AIL#12)
 --   ProcBody.cond       — OERR/FERR/full guards in ISR
+--   makeINTCON          — INTCON/GIE nodes for critical section (AIL#14)
 --   ProcBody.intrinsic  — ring buffer pop, line append (FSR ops not yet
 --                         expressible as abstract typed nodes; AIL#13, #21)
 --
 -- Known design gaps (see LANGDEF.md and open GitHub issues):
---   AIL#13  FSR resource annotations — pop and push both use FSR0; no
---           critical section protection (see AIL#14).
---   AIL#14  Critical sections — BCF/BSF INTCON.GIE not yet typed nodes.
+--   AIL#13  FSR resource annotations — pop/push use FSR0; the critical section
+--           (AIL#14) prevents ISR corruption but a typed annotation would allow
+--           the compiler to verify the non-conflict with FSR1 in append_line.
 --   AIL#19  Static RAM allocator — addresses assigned manually here.
---   AIL#20  Implicit Store merging — rb.nodes merged manually below.
+--   AIL#20  Implicit Store merging — rb/ic nodes merged manually below.
 
 import AIL
 import AIL.Lib.RingBuf
@@ -72,6 +73,13 @@ private def h_Z := hashNode n_Z
 -- ---------------------------------------------------------------------------
 
 private def rb := makeRingBuf 0x20 0x21 0x23 0x22 32 1000 "rx"
+
+-- ---------------------------------------------------------------------------
+-- INTCON — critical section primitives (AIL#14)
+-- Classic PIC18 / Q71: INTCON at SFR 0xFF2, GIE = bit 7.
+-- ---------------------------------------------------------------------------
+
+private def ic := makeINTCON 0xFF2
 
 -- ---------------------------------------------------------------------------
 -- Application state
@@ -216,12 +224,20 @@ private def n_pop : Node := .proc #[] #[h_getch_result]
       s!"    andwf   {hashLabel rb.h_head}, f, c"]
     #[rb.h_data, rb.h_head] #[rb.h_head, h_getch_result]
     #["pop buf[head] → getch_result; advance head mod 32",
-      "TODO AIL#13: uses FSR0, conflicts with ISR push (needs critical section AIL#14)"])
+      "uses FSR0; caller (critical_pop) wraps in BCF/BSF INTCON.GIE (AIL#14 resolved)",
+      "TODO AIL#13: FSR annotation would make the FSR0 usage statically checkable"])
   "rx_pop"
 private def h_pop := hashNode n_pop
 
+-- critical section: disable_ints; pop; enable_ints
+-- Protects FSR0 use in pop from being clobbered by the UART ISR (which also
+-- uses FSR0 for ring buffer push). BCF/BSF INTCON.GIE (makeINTCON, AIL#14).
+private def n_critical_pop : Node := .proc #[] #[h_getch_result]
+  (.seq #[ic.h_disable_ints, h_pop, ic.h_enable_ints]) "critical_pop"
+private def h_critical_pop := hashNode n_critical_pop
+
 private def n_getch : Node := .proc #[] #[h_getch_result]
-  (.seq #[h_getch_spin, h_pop]) "getch"
+  (.seq #[h_getch_spin, h_critical_pop]) "getch"
 private def h_getch := hashNode n_getch
 
 -- newline detection: load getch_result; xorlw '\n'; btfss STATUS,Z
@@ -289,6 +305,8 @@ private def h_main := hashNode n_main
 def appStore : Store :=
   -- Ring buffer nodes
   let s := rb.nodes.foldl (fun acc (h, n) => Store.insert acc h n) Store.empty
+  -- INTCON / critical section nodes (AIL#14)
+  let s := ic.nodes.foldl (fun acc (h, n) => Store.insert acc h n) s
   -- SFRs
   let s := Store.insert s h_RCSTA             n_RCSTA
   let s := Store.insert s h_RCREG             n_RCREG
@@ -327,6 +345,7 @@ def appStore : Store :=
   let s := Store.insert s h_getch_nop         n_getch_nop
   let s := Store.insert s h_getch_spin        n_getch_spin
   let s := Store.insert s h_pop               n_pop
+  let s := Store.insert s h_critical_pop      n_critical_pop
   let s := Store.insert s h_getch             n_getch
   let s := Store.insert s h_load_gc           n_load_gc
   let s := Store.insert s h_xor_nl            n_xor_nl
